@@ -17,4 +17,4 @@ COPY app.py .
 ENV PORT=3000
 EXPOSE 3000
 
-CMD ["gunicorn", "-b", "0.0.0.0:3000", "-w", "2", "--timeout", "300", "app:app"]
+CMD ["gunicorn", "-b", "0.0.0.0:3000", "-w", "2", "--worker-class", "gthread", "--threads", "8", "--timeout", "300", "app:app"]

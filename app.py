@@ -74,14 +74,15 @@ def is_drm(url: str) -> bool:
     return any(d in u for d in DRM_HOSTS)
 
 
-def build_cmd(url: str, mode: str, fmt: str, use_cookies: bool, extra: list[str] | None = None) -> list[str]:
+def build_cmd(url: str, mode: str, fmt: str, use_cookies: bool, client: str,
+              extra: list[str] | None = None) -> list[str]:
     out_tpl = str(DOWNLOADS_DIR / "%(title).80B-%(id)s.%(ext)s")
     cmd = ["yt-dlp", "--no-playlist", "--newline", "--no-warnings", "--no-color",
-           "-o", out_tpl, "--retries", "3", "--fragment-retries", "3",
+           "-o", out_tpl, "--retries", "2", "--fragment-retries", "2",
            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
                            "Chrome/126.0.0.0 Safari/537.36",
-           "--extractor-args", "youtube:player_client=web,default"]
+           "--extractor-args", f"youtube:player_client={client}"]
 
     if mode == "audio":
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "192K"]
@@ -102,6 +103,10 @@ def build_cmd(url: str, mode: str, fmt: str, use_cookies: bool, extra: list[str]
 
     cmd.append(url)
     return cmd
+
+
+# Urutan prioritas client YouTube: dari yang paling reliable tanpa cookies
+YOUTUBE_CLIENTS = ["web_safari", "tv_embedded", "ios", "mediaconnect", "web", "android"]
 
 
 def fetch_metadata(url: str) -> dict:
@@ -161,75 +166,84 @@ def _job_emit(job_id: str, event: dict):
 
 
 def run_download_job(job_id: str, url: str, mode: str, fmt: str):
+    """Jalankan download dengan beberapa YouTube client secara bergantian.
+    Untuk platform lain (SoundCloud, dll) gunakan client default "web_safari" sendiri.
+    """
     platform = detect_platform(url)
-    if is_drm(url):
-        _job_emit(job_id, {"stage": "error", "message": "Sumber dilindungi DRM.", "drm": True})
-        with JOBS_LOCK:
-            JOBS[job_id]["done"] = True
-            JOBS[job_id]["result"] = {"success": False, "drm": True, "platform": "drm",
-                                       "error": "DRM-protected content"}
-        return
+    cookies_used = COOKIES_PATH.exists()
 
-    _job_emit(job_id, {"stage": "metadata", "message": "Mengambil metadata…", "pct": 5})
-    use_cookies = COOKIES_PATH.exists()
-    cmd = build_cmd(url, mode, fmt, use_cookies, extra=["--progress"])
+    # Client order: mulai dari yang paling terpercaya, terakhir fallback ke yang pasti bekerja
+    clients = []
+    if platform == "youtube":
+        clients = YOUTUBE_CLIENTS[:]
+    else:
+        clients = ["web_safari"]  # platform lain pakai satu client
 
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, bufsize=1)
-    except Exception as e:
-        _job_emit(job_id, {"stage": "error", "message": humanize_error(str(e))})
-        with JOBS_LOCK:
-            JOBS[job_id]["done"] = True
-            JOBS[job_id]["result"] = {"success": False, "platform": platform, "error": str(e)}
-        return
-
-    _job_emit(job_id, {"stage": "downloading", "message": "Mengunduh…", "pct": 10})
-    tail_lines: list[str] = []
-    pct_re = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
-    merge_seen = False
-
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        if not line:
+    for client in clients:
+        cmd = build_cmd(url, mode, fmt, cookies_used, client, extra=["--progress"])
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1)
+        except Exception as e:
             continue
-        tail_lines.append(line)
-        if len(tail_lines) > 40:
-            tail_lines.pop(0)
-        m = pct_re.search(line)
-        if m:
-            pct = min(95.0, float(m.group(1)))
-            _job_emit(job_id, {"stage": "downloading",
-                                "message": f"Mengunduh… {pct:.0f}%", "pct": pct})
-        elif "merg" in line.lower() and not merge_seen:
-            merge_seen = True
-            _job_emit(job_id, {"stage": "merging", "message": "Menggabungkan audio & video…", "pct": 96})
 
-    proc.wait(timeout=300)
-    stderr_tail = "\n".join(tail_lines[-15:])
+        _job_emit(job_id, {"stage": "downloading", "message": f"Mengunduh (client {client})…", "pct": 10})
+        tail_lines = []
+        pct_re = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
+        merge_seen = False
 
-    files = sorted(DOWNLOADS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    target = next((f for f in files if f.is_file() and f.stat().st_size > 0), None)
+        for line in proc.stdout:  # type: ignore
+            line = line.rstrip()
+            if not line:
+                continue
+            tail_lines.append(line)
+            if len(tail_lines) > 40:
+                tail_lines.pop(0)
+            m = pct_re.search(line)
+            if m:
+                pct = min(95.0, float(m.group(1)))
+                _job_emit(job_id, {"stage": "downloading", "message": f"Mengunduh (client {client})… {pct:.0f}%", "pct": pct})
+            elif "merg" in line.lower() and not merge_seen:
+                merge_seen = True
+                _job_emit(job_id, {"stage": "merging", "message": "Menggabungkan audio & video…", "pct": 96})
 
-    if proc.returncode != 0 or target is None:
-        need_cookies = bool(re.search(r"sign in to confirm|confirm you.?re not a bot",
-                                       stderr_tail, re.I))
-        msg = humanize_error(stderr_tail)
-        _job_emit(job_id, {"stage": "error", "message": msg})
-        with JOBS_LOCK:
-            JOBS[job_id]["done"] = True
-            JOBS[job_id]["result"] = {"success": False, "platform": platform,
-                                       "need_cookies": need_cookies,
-                                       "error": msg, "stderr": stderr_tail}
-        return
+        proc.wait(timeout=300)
+        stderr_tail = "\n".join(tail_lines[-15:])
 
-    size = target.stat().st_size
-    _job_emit(job_id, {"stage": "done", "message": "Selesai!", "pct": 100})
+        files = sorted(DOWNLOADS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        target = next((f for f in files if f.is_file() and f.stat().st_size > 0), None)
+
+        if proc.returncode == 0 and target is not None:
+            # Sukses dengan client ini
+            size = target.stat().st_size
+            _job_emit(job_id, {"stage": "done", "message": "Selesai!", "pct": 100})
+            with JOBS_LOCK:
+                JOBS[job_id]["done"] = True
+                JOBS[job_id]["result"] = {"success": True, "platform": platform, "file": target.name,
+                                           "size_bytes": size, "url": f"/file/{target.name}"}
+            return
+        else:
+            # Gagal, catat error terakhir tapi lanjut ke client berikutnya (kecuali platform bukan youtube)
+            _job_emit(job_id, {"stage": "error", "message": humanize_error(stderr_tail)})
+            # Kalau error bukan bot dan platform bukan youtube, keluar
+            if platform != "youtube":
+                with JOBS_LOCK:
+                    JOBS[job_id]["done"] = True
+                    JOBS[job_id]["result"] = {"success": False, "platform": platform,
+                                               "error": humanize_error(stderr_tail),
+                                               "stderr": stderr_tail}
+                return
+            # Kalau error bot, coba client selanjutnya
+            continue
+
+    # Semua client youtube gagal (semua bot)
+    _job_emit(job_id, {"stage": "error", "message": "Semua client YouTube terblokir. Unggah cookies untuk bypass verifikasi bot."})
     with JOBS_LOCK:
         JOBS[job_id]["done"] = True
-        JOBS[job_id]["result"] = {"success": True, "platform": platform, "file": target.name,
-                                   "size_bytes": size, "url": f"/file/{target.name}"}
+        JOBS[job_id]["result"] = {"success": False, "platform": platform, "need_cookies": True,
+                                   "error": "YouTube meminta verifikasi. Unggah cookies di panel bawah.",
+                                   "stderr": "Semua client YouTube terblokir."}
+
 
 
 INDEX_HTML = r"""<!doctype html>

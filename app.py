@@ -751,7 +751,7 @@ def _security_headers(resp):
         "default-src 'self'; "
         "img-src 'self' https://i.ytimg.com https://i9.ytimg.com data:; "
         "style-src 'self' 'unsafe-inline'; "
-        "script-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
         "connect-src 'self'; "
         "frame-ancestors 'none'; "
         "base-uri 'self'; "

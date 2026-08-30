@@ -1,0 +1,6 @@
+build:
+  docker build -t mydownloader .
+web:
+  image: mydownloader
+  ports:
+    - "3000:3000"

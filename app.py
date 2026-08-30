@@ -39,6 +39,8 @@ RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))  # 60 detik
 COOKIES_MAX_BYTES = 256 * 1024  # 256 KB cukup untuk cookies.txt
 # Janitor: bersihkan JOBS yang tidak selesai setelah TTL ini (detik)
 JOB_TTL = int(os.environ.get("JOB_TTL", "1800"))  # 30 menit
+# Batas panjang URL untuk mencegah memory abuse pada parameter ?url=...
+MAX_URL_LEN = int(os.environ.get("MAX_URL_LEN", "2048"))
 # Domain CDN thumbnail YouTube yang boleh di-load via <img> (untuk CSP)
 _THUMB_HOSTS = ("i.ytimg.com", "i9.ytimg.com")
 
@@ -451,6 +453,10 @@ details summary{cursor:pointer;font-size:13px;color:var(--muted);user-select:non
 @keyframes tin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 .toast button{background:none;border:0;color:var(--brand2);cursor:pointer;font-size:12px;margin-left:8px}
 code{font-size:11px;word-break:break-all}
+.disclaimer{margin-top:18px;padding:12px 14px;border-radius:10px;
+  background:var(--bg);border:1px solid var(--line);font-size:12px;color:var(--muted);
+  line-height:1.6}
+.disclaimer b{color:var(--warn)}
 </style>
 </head>
 <body>
@@ -513,7 +519,17 @@ code{font-size:11px;word-break:break-all}
     <div id="ckmsg" style="margin-top:10px"></div>
   </div>
 
-  <footer>mydownloader · Render free tier · File sementara, hilang saat restart</footer>
+  <footer>
+    <div class="disclaimer">
+      <b>⚖️ Penggunaan yang bertanggung jawab.</b>
+      mydownloader disediakan untuk mengunduh konten yang <b>Anda miliki haknya</b>
+      atau yang diizinkan untuk diunduh (mis. CC-BY, domain publik, video Anda sendiri).
+      Mengunduh materi berhak cipta tanpa izin dapat melanggar ToS platform dan hukum
+      setempat. Konten terproteksi DRM (Spotify, Netflix, Disney+, dsb.) <b>ditolak otomatis</b>.
+      Pengguna bertanggung jawab penuh atas penggunaan alat ini.
+    </div>
+    <div style="margin-top:14px">mydownloader · Render free tier · File sementara, hilang saat restart</div>
+  </footer>
 </div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
@@ -721,6 +737,34 @@ document.getElementById('ckup').addEventListener('click',async()=>{
 </html>"""
 
 
+@app.after_request
+def _security_headers(resp):
+    """Tambah header keamanan dasar. CSP保守: izinkan img dari ytimg & data:;
+    script-src 'self' (tidak ada inline script di template). inline style dipakai
+    untuk UI — izinkan via 'unsafe-inline' (alternatif: hash/nonce, biaya besar)."""
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    # HSTS 1 tahun. HTTPS wajib di Render; aman untuk prod.
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "img-src 'self' https://i.ytimg.com https://i9.ytimg.com data:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    # Endpoint download perlu as_attachment (inline aman karena domain sendiri)
+    if request.path.startswith("/file/"):
+        resp.headers["Content-Disposition"] = resp.headers.get(
+            "Content-Disposition", "attachment"
+        )
+    return resp
+
+
 @app.before_request
 def _before_request():
     # Janitor ringan: setiap ~50 request bersihkan job expired. Threshold kasar
@@ -752,6 +796,8 @@ def api_download_start():
     fmt = (request.args.get("format") or "best").strip()
     if not url:
         return jsonify({"error": "URL kosong"}), 400
+    if len(url) > MAX_URL_LEN:
+        return jsonify({"error": f"URL terlalu panjang (maks {MAX_URL_LEN} karakter)"}), 414
     if mode not in ("auto", "video", "audio"):
         mode = "auto"
 
@@ -806,6 +852,9 @@ def api_metadata():
     url = (request.args.get("url") or "").strip()
     if not url:
         return jsonify({"success": False, "error": "URL kosong"}), 400
+    if len(url) > MAX_URL_LEN:
+        return jsonify({"success": False,
+                        "error": f"URL terlalu panjang (maks {MAX_URL_LEN} karakter)"}), 414
     return jsonify(fetch_metadata(url))
 
 

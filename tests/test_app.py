@@ -218,3 +218,64 @@ def test_janitor_cleans_expired_jobs():
     # Cleanup
     with app_module.JOBS_LOCK:
         app_module.JOBS.clear()
+
+
+# === Security headers ===
+
+def test_security_headers_present(client):
+    """Setiap response harus punya security headers dasar."""
+    r = client.get("/health")
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["X-Frame-Options"] == "DENY"
+    assert r.headers["Referrer-Policy"] == "no-referrer"
+    assert "max-age=31536000" in r.headers["Strict-Transport-Security"]
+    csp = r.headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert "https://i.ytimg.com" in csp
+
+
+def test_csp_on_index_html(client):
+    """Landing page juga kena CSP (img-src izinkan ytimg)."""
+    r = client.get("/")
+    assert r.status_code == 200
+    csp = r.headers["Content-Security-Policy"]
+    assert "img-src" in csp
+    assert "i.ytimg.com" in csp
+
+
+# === URL length validation ===
+
+def test_download_url_too_long_414(client, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_URL_LEN", 100)
+    with app_module._RATE_LOCK:
+        app_module._RATE_BUCKETS.clear()
+    long_url = "https://example.com/" + ("a" * 200)
+    r = client.get(f"/api/download/start?url={long_url}",
+                   headers={"X-Forwarded-For": "1.1.1.1"})
+    assert r.status_code == 414
+    assert "terlalu panjang" in r.get_json()["error"]
+
+
+def test_metadata_url_too_long_414(client, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_URL_LEN", 100)
+    with app_module._RATE_LOCK:
+        app_module._RATE_BUCKETS.clear()
+    long_url = "https://example.com/" + ("a" * 200)
+    r = client.get(f"/api/metadata?url={long_url}",
+                   headers={"X-Forwarded-For": "2.2.2.2"})
+    assert r.status_code == 414
+
+
+def test_download_url_at_limit_accepted(client, monkeypatch):
+    """URL tepat di batas harus diterima (boundary check)."""
+    monkeypatch.setattr(app_module, "MAX_URL_LEN", 100)
+    with app_module._RATE_LOCK:
+        app_module._RATE_BUCKETS.clear()
+    # URL dengan panjang total = 100 (domain "https://youtu.be/" = 17 char + 83 char path)
+    ok_url = "https://youtu.be/" + ("a" * 83)  # total = 100
+    assert len(ok_url) == 100
+    r = client.get(f"/api/download/start?url={ok_url}",
+                   headers={"X-Forwarded-For": "3.3.3.3"})
+    assert r.status_code == 200
+    assert "job_id" in r.get_json()

@@ -2,6 +2,8 @@
 
 Web downloader untuk YouTube, Spotify, SoundCloud, X, Facebook. Deploy gratis di Render.
 
+> ⚖️ **Disclaimer.** mydownloader disediakan untuk mengunduh konten yang **Anda miliki haknya** atau yang diizinkan untuk diunduh (CC-BY, domain publik, video Anda sendiri). Mengunduh materi berhak cipta tanpa izin dapat melanggar ToS platform dan hukum setempat. Konten terproteksi DRM (Spotify, Netflix, Disney+, dsb.) **ditolak otomatis**. Pengguna bertanggung jawab penuh atas penggunaan alat ini.
+
 ## Endpoints
 
 - `GET /` — Halaman web
@@ -24,6 +26,7 @@ Opsional (ada default):
 - `RATE_LIMIT_MAX` (default 10)
 - `RATE_LIMIT_WINDOW` (default 60)
 - `JOB_TTL` (default 1800)
+- `MAX_URL_LEN` (default 2048)
 
 ## Deploy ke Render
 

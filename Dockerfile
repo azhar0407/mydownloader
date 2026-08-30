@@ -1,8 +1,3 @@
-# Build
-FROM node:20-alpine AS builder
-# Tidak ada build step, copy source
-
-# Run
 FROM python:3.12-slim
 WORKDIR /app
 

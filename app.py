@@ -4,16 +4,20 @@ mydownloader — Flask web downloader for YouTube, SoundCloud, Facebook, X (Twit
 Deploy target: Render (free tier). Production WSGI: gunicorn.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request, send_file, render_template_string
+from flask import Flask, Response, abort, jsonify, request, send_file, render_template_string
 
 app = Flask(__name__)
 
@@ -22,9 +26,28 @@ DOWNLOADS_DIR = Path(os.environ.get("DOWNLOADS_DIR", "/tmp/downloads"))
 COOKIES_PATH = Path(os.environ.get("COOKIES_PATH", "/tmp/cookies.txt"))
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# job_id -> {"events": [...], "done": bool, "result": dict|None, "lock": Lock}
+# === Keamanan & limit ===
+# Secret untuk HMAC signed download URL. Generate otomatis kalau env SECRET_KEY kosong
+# (cukup untuk single-instance; restart akan rotate token lama → user re-klik link).
+SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+# TTL token unduhan (detik). Setelah itu /file/<token> expired.
+FILE_TOKEN_TTL = int(os.environ.get("FILE_TOKEN_TTL", "3600"))  # 1 jam
+# Rate limit: max N request per window per IP
+RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "10"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))  # 60 detik
+# Batas ukuran file cookies upload (Flask default 16MB sudah cukup, tapi kita tetapkan)
+COOKIES_MAX_BYTES = 256 * 1024  # 256 KB cukup untuk cookies.txt
+# Janitor: bersihkan JOBS yang tidak selesai setelah TTL ini (detik)
+JOB_TTL = int(os.environ.get("JOB_TTL", "1800"))  # 30 menit
+# Domain CDN thumbnail YouTube yang boleh di-load via <img> (untuk CSP)
+_THUMB_HOSTS = ("i.ytimg.com", "i9.ytimg.com")
+
+# job_id -> {"events": deque, "done": bool, "result": dict|None, "created": float, "files": [str]}
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
+# Rate limit per-IP: deque[timestamps]
+_RATE_BUCKETS: dict[str, deque] = {}
+_RATE_LOCK = threading.Lock()
 
 URL_PATTERNS = [
     ("youtube", r"(youtube\.com|youtu\.be)"),
@@ -59,6 +82,76 @@ def humanize_error(raw: str) -> str:
     return "Gagal mengunduh. Periksa URL atau coba lagi."
 
 
+# === Keamanan helper ===
+
+def get_client_ip() -> str:
+    """Ambil IP client, hormati X-Forwarded-For hanya kalau di belakang proxy tepercaya.
+    Render selalu set X-Forwarded-For. Untuk single-instance publik, kita ambil
+    header pertama (real client) — risiko spoofing rendah karena tidak ada
+    state rahasia per-IP, hanya rate limit kasar."""
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def rate_limit_ok() -> bool:
+    """Sliding window rate limit per-IP. True = boleh lanjut, False = harus 429."""
+    ip = get_client_ip()
+    now = time.time()
+    with _RATE_LOCK:
+        bucket = _RATE_BUCKETS.setdefault(ip, deque())
+        # Buang timestamp di luar window
+        while bucket and bucket[0] < now - RATE_LIMIT_WINDOW:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_MAX:
+            return False
+        bucket.append(now)
+        return True
+
+
+def sign_file_token(filename: str) -> str:
+    """Token untuk URL /file/<token>. Format: <exp>.<sig>
+    Sig = HMAC-SHA256(secret, exp + ":" + filename) hex (16 char cukup)."""
+    exp = int(time.time()) + FILE_TOKEN_TTL
+    msg = f"{exp}:{filename}".encode()
+    sig = hmac.new(SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()[:32]
+    return f"{exp}.{sig}"
+
+
+def verify_file_token(token: str, filename: str) -> bool:
+    """Verifikasi token. False kalau expired atau sig salah → 403/410."""
+    try:
+        exp_str, sig = token.split(".", 1)
+        exp = int(exp_str)
+    except (ValueError, AttributeError):
+        return False
+    if time.time() > exp:
+        return False
+    expected = hmac.new(SECRET_KEY.encode(),
+                        f"{exp}:{filename}".encode(),
+                        hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(sig, expected)
+
+
+def janitor_tick() -> None:
+    """Cleanup background: hapus JOBS yang expired DAN file temporer terkait.
+    Dipanggil dari endpoint /health & dari thread daemon."""
+    now = time.time()
+    expired_files = []
+    with JOBS_LOCK:
+        for jid, job in list(JOBS.items()):
+            age = now - job.get("created", now)
+            if age > JOB_TTL:
+                expired_files.extend(job.get("files", []))
+                del JOBS[jid]
+    for name in expired_files:
+        try:
+            (DOWNLOADS_DIR / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def detect_platform(url: str) -> str:
     u = url.lower()
     for name, pat in URL_PATTERNS:
@@ -75,8 +168,11 @@ def is_drm(url: str) -> bool:
 
 
 def build_cmd(url: str, mode: str, fmt: str, use_cookies: bool, client: str,
+              job_id: str = "",
               extra: list[str] | None = None) -> list[str]:
-    out_tpl = str(DOWNLOADS_DIR / "%(title).80B-%(id)s.%(ext)s")
+    # Job_id prefix di filename → picker tidak salah ambil file job lain.
+    prefix = f"{job_id}__" if job_id else ""
+    out_tpl = str(DOWNLOADS_DIR / f"{prefix}%(title).80B-%(id)s.%(ext)s")
     cmd = ["yt-dlp", "--no-playlist", "--newline", "--no-warnings", "--no-color",
            "-o", out_tpl, "--retries", "2", "--fragment-retries", "2",
            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -165,9 +261,22 @@ def _job_emit(job_id: str, event: dict):
             job["events"].append(event)
 
 
+def _job_finalize(job_id: str, **fields) -> bool:
+    """Set final fields on a job atomically. Returns True kalau job masih ada,
+    False kalau sudah dihapus (janitor/stream close). Aman dipanggil dari thread manapun."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return False
+        for k, v in fields.items():
+            job[k] = v
+        return True
+
+
 def run_download_job(job_id: str, url: str, mode: str, fmt: str):
     """Jalankan download dengan beberapa YouTube client secara bergantian.
     Untuk platform lain (SoundCloud, dll) gunakan client default "web_safari" sendiri.
+    File hasil selalu ber-prefix job_id agar picker tidak salah ambil dari job lain.
     """
     platform = detect_platform(url)
     cookies_used = COOKIES_PATH.exists()
@@ -179,8 +288,11 @@ def run_download_job(job_id: str, url: str, mode: str, fmt: str):
     else:
         clients = ["web_safari"]  # platform lain pakai satu client
 
+    written_files: list[str] = []
+
     for client in clients:
-        cmd = build_cmd(url, mode, fmt, cookies_used, client, extra=["--progress"])
+        cmd = build_cmd(url, mode, fmt, cookies_used, client,
+                        job_id=job_id, extra=["--progress"])
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, bufsize=1)
@@ -210,39 +322,46 @@ def run_download_job(job_id: str, url: str, mode: str, fmt: str):
         proc.wait(timeout=300)
         stderr_tail = "\n".join(tail_lines[-15:])
 
-        files = sorted(DOWNLOADS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-        target = next((f for f in files if f.is_file() and f.stat().st_size > 0), None)
+        # Picker: hanya file ber-prefix job_id ini, ukuran > 0.
+        prefix = f"{job_id}__"
+        try:
+            target = next(
+                (f for f in DOWNLOADS_DIR.iterdir()
+                 if f.is_file() and f.name.startswith(prefix) and f.stat().st_size > 0
+                 and f.name not in written_files),
+                None,
+            )
+        except (FileNotFoundError, OSError):
+            target = None
 
         if proc.returncode == 0 and target is not None:
-            # Sukses dengan client ini
             size = target.stat().st_size
+            written_files.append(target.name)
             _job_emit(job_id, {"stage": "done", "message": "Selesai!", "pct": 100})
-            with JOBS_LOCK:
-                JOBS[job_id]["done"] = True
-                JOBS[job_id]["result"] = {"success": True, "platform": platform, "file": target.name,
-                                           "size_bytes": size, "url": f"/file/{target.name}"}
+            _job_finalize(job_id, done=True, files=written_files, result={
+                "success": True,
+                "platform": platform,
+                "file": target.name,
+                "size_bytes": size,
+                "token": sign_file_token(target.name),
+                "url": f"/file/{sign_file_token(target.name)}/{target.name}",
+            })
             return
         else:
-            # Gagal, catat error terakhir tapi lanjut ke client berikutnya (kecuali platform bukan youtube)
             _job_emit(job_id, {"stage": "error", "message": humanize_error(stderr_tail)})
-            # Kalau error bukan bot dan platform bukan youtube, keluar
             if platform != "youtube":
-                with JOBS_LOCK:
-                    JOBS[job_id]["done"] = True
-                    JOBS[job_id]["result"] = {"success": False, "platform": platform,
-                                               "error": humanize_error(stderr_tail),
-                                               "stderr": stderr_tail}
+                _job_finalize(job_id, done=True, files=written_files, result={
+                    "success": False, "platform": platform,
+                    "error": humanize_error(stderr_tail),
+                    "stderr": stderr_tail})
                 return
-            # Kalau error bot, coba client selanjutnya
             continue
 
-    # Semua client youtube gagal (semua bot)
     _job_emit(job_id, {"stage": "error", "message": "Semua client YouTube terblokir. Unggah cookies untuk bypass verifikasi bot."})
-    with JOBS_LOCK:
-        JOBS[job_id]["done"] = True
-        JOBS[job_id]["result"] = {"success": False, "platform": platform, "need_cookies": True,
-                                   "error": "YouTube meminta verifikasi. Unggah cookies di panel bawah.",
-                                   "stderr": "Semua client YouTube terblokir."}
+    _job_finalize(job_id, done=True, files=written_files, result={
+        "success": False, "platform": platform, "need_cookies": True,
+        "error": "YouTube meminta verifikasi. Unggah cookies di panel bawah.",
+        "stderr": "Semua client YouTube terblokir."})
 
 
 
@@ -372,6 +491,8 @@ code{font-size:11px;word-break:break-all}
     </div>
     <div class="help" id="hint">Tempel URL publik dari platform yang didukung. Tekan <b>Enter</b> untuk mulai.</div>
 
+    <div id="preview" style="display:none"></div>
+
     <div id="result"></div>
   </div>
 
@@ -416,7 +537,35 @@ function toast(msg,kind='ok',undoFn=null){
   setTimeout(()=>el.remove(),5000);
 }
 
-function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+// ---------- Metadata preview ----------
+let previewTimer=null;
+async function fetchPreview(url){
+  if(!/^https?:\/\//i.test(url)){hidePreview();return}
+  clearTimeout(previewTimer);
+  previewTimer=setTimeout(async()=>{
+    try{
+      const r=await fetch('/api/metadata?url='+encodeURIComponent(url));
+      const d=await r.json();
+      if(d.success){showPreview(d)}else{hidePreview()}
+    }catch(e){hidePreview()}
+  },400);
+}
+function showPreview(d){
+  const box=document.getElementById('preview');
+  const thumb=d.thumbnail && /^https?:\/\/(i\d*\.ytimg\.com|i\.ytimg\.com)/.test(d.thumbnail)
+    ? `<img src="${esc(d.thumbnail)}" alt="" referrerpolicy="no-referrer" loading="lazy">` : '';
+  const dur=d.duration_str?' · '+esc(d.duration_str):'';
+  box.innerHTML=`<div class="preview">${thumb}
+    <div class="meta"><b>${esc(d.title||'(tanpa judul)')}</b>
+      ${esc(d.uploader||'')}${dur}<br>${esc(d.platform||'')}</div></div>`;
+  box.style.display='block';
+}
+function hidePreview(){
+  const box=document.getElementById('preview');
+  if(box){box.style.display='none';box.innerHTML=''}
+}
 
 // ---------- Tabs ----------
 const tabs=document.querySelectorAll('.tab');
@@ -465,6 +614,7 @@ $u.addEventListener('keydown',e=>{
   if(e.key==='Enter') run();
   if(e.key==='Escape') $u.value='';
 });
+$u.addEventListener('input',e=>fetchPreview(e.target.value));
 
 function saveHistory(entry){
   const key='mdl_history';
@@ -536,7 +686,7 @@ function renderResult(d,url){
       <b>✓ Berhasil</b> · ${esc(d.platform)} · ${sz} MB
       <div class="file-item">
         <div><b>${esc(d.file)}</b><div class="file-meta">${d.size_bytes.toLocaleString()} bytes</div></div>
-        <a class="btn" href="/file/${encodeURIComponent(d.file)}" download>Simpan</a>
+        <a class="btn" href="${esc(d.url)}" download>Simpan</a>
       </div>
     </div>`);
     toast('Unduhan selesai: '+d.file);
@@ -571,6 +721,23 @@ document.getElementById('ckup').addEventListener('click',async()=>{
 </html>"""
 
 
+@app.before_request
+def _before_request():
+    # Janitor ringan: setiap ~50 request bersihkan job expired. Threshold kasar
+    # supaya tidak panggil di tiap request.
+    if not hasattr(app, "_req_count"):
+        app._req_count = 0
+    app._req_count += 1
+    if app._req_count % 50 == 0:
+        janitor_tick()
+
+
+@app.route("/robots.txt")
+def robots():
+    return Response("User-agent: *\nDisallow: /api/\nDisallow: /file/\n",
+                    mimetype="text/plain")
+
+
 @app.route("/")
 def index():
     return render_template_string(INDEX_HTML)
@@ -578,6 +745,8 @@ def index():
 
 @app.route("/api/download/start", methods=["GET"])
 def api_download_start():
+    if not rate_limit_ok():
+        return jsonify({"error": "Terlalu banyak permintaan. Tunggu beberapa detik."}), 429
     url = (request.args.get("url") or "").strip()
     mode = (request.args.get("mode") or "auto").strip()
     fmt = (request.args.get("format") or "best").strip()
@@ -588,7 +757,8 @@ def api_download_start():
 
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
-        JOBS[job_id] = {"events": [], "done": False, "result": None}
+        JOBS[job_id] = {"events": deque(), "done": False, "result": None,
+                        "files": [], "created": time.time()}
     t = threading.Thread(target=run_download_job, args=(job_id, url, mode, fmt), daemon=True)
     t.start()
     return jsonify({"job_id": job_id})
@@ -605,7 +775,8 @@ def api_download_stream(job_id):
                 if job is None:
                     yield f"data: {json.dumps({'stage': 'error', 'message': 'Job tidak ditemukan'})}\n\n"
                     return
-                events = job["events"][sent:]
+                # deque mendukung slicing via itertools.islice; pakai list copy
+                events = list(job["events"])[sent:]
                 sent = len(job["events"])
                 done = job["done"]
                 result = job["result"]
@@ -619,24 +790,49 @@ def api_download_stream(job_id):
             time.sleep(0.5)
         yield f"data: {json.dumps({'stage': 'error', 'message': 'Timeout'})}\n\n"
 
-    return Response(gen(), mimetype="text/event-stream",
-                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    # direct_passthrough=False default, tapi kita pakai generator yang sudah yield str.
+    # Flush per yield via Response dengan explicit header agar gunicorn tidak buffer.
+    response = Response(gen(), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache",
+                                 "X-Accel-Buffering": "no"})
+    response.implicit_sequence_conversion = False
+    return response
 
 
 @app.route("/api/metadata", methods=["GET"])
 def api_metadata():
+    if not rate_limit_ok():
+        return jsonify({"success": False, "error": "Rate limit"}), 429
     url = (request.args.get("url") or "").strip()
     if not url:
         return jsonify({"success": False, "error": "URL kosong"}), 400
     return jsonify(fetch_metadata(url))
 
 
-@app.route("/file/<path:filename>")
-def get_file(filename):
+@app.route("/file/<token>/<path:filename>")
+def get_file(token, filename):
+    # Tolak traversal & wajib token valid.
+    if "/" in filename or ".." in filename or "\\" in filename:
+        abort(400)
     safe = (DOWNLOADS_DIR / filename).resolve()
-    if not str(safe).startswith(str(DOWNLOADS_DIR.resolve())) or not safe.exists():
-        return jsonify({"error": "File tidak ditemukan"}), 404
-    return send_file(str(safe), as_attachment=True, download_name=safe.name)
+    try:
+        if DOWNLOADS_DIR.resolve() not in safe.parents and safe != DOWNLOADS_DIR.resolve():
+            abort(404)
+    except (OSError, ValueError):
+        abort(404)
+    if not safe.exists() or not safe.is_file():
+        abort(404)
+    if not verify_file_token(token, filename):
+        # 410 Gone untuk expired, 403 untuk signature invalid
+        try:
+            exp_str = token.split(".", 1)[0]
+            if int(exp_str) < time.time():
+                abort(410)
+        except (ValueError, IndexError):
+            pass
+        abort(403)
+    return send_file(str(safe), as_attachment=True, download_name=safe.name,
+                     max_age=0)
 
 
 @app.route("/api/cookies", methods=["POST"])
@@ -644,7 +840,15 @@ def api_cookies():
     f = request.files.get("cookies")
     if not f:
         return jsonify({"success": False, "error": "Tidak ada file"}), 400
-    f.save(COOKIES_PATH)
+    # Validasi ekstensi & ukuran
+    if not (f.filename or "").lower().endswith(".txt"):
+        return jsonify({"success": False, "error": "File harus .txt"}), 400
+    # Simpan ke temp lalu cek ukuran
+    data = f.read(COOKIES_MAX_BYTES + 1)
+    if len(data) > COOKIES_MAX_BYTES:
+        return jsonify({"success": False,
+                        "error": f"Terlalu besar (maks {COOKIES_MAX_BYTES//1024} KB)"}), 413
+    COOKIES_PATH.write_bytes(data)
     return jsonify({"success": True, "size": COOKIES_PATH.stat().st_size})
 
 

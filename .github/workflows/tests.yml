@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install ffmpeg (untuk import app, yt-dlp opsional)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Run tests
+        env:
+          SECRET_KEY: ci-test-secret
+          DOWNLOADS_DIR: /tmp/ci_downloads
+          COOKIES_PATH: /tmp/ci_cookies.txt
+          RATE_LIMIT_MAX: "100"
+        run: |
+          mkdir -p /tmp/ci_downloads
+          pytest tests/ -v --tb=short

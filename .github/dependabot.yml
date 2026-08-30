@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+    groups:
+      yt-dlp:
+        patterns:
+          - "yt-dlp"
+        # YouTube rotasi signature tiap minggu → butuh update cepat
+    # Hanya yt-dlp yang auto-merge aman; flask/gunicorn butuh review manual
+    ignore:
+      - dependency-name: "flask*"
+      - dependency-name: "gunicorn*"
+    # yt-dlp version baru yang menyentuh ekstraktor youtube → test dulu
+    # (tidak ada automerge di repo ini; user review + merge manual)
